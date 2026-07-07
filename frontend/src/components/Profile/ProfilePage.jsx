@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react'
+import { useParams } from 'react-router-dom'
 import { useParams , useNavigate} from 'react-router-dom'
 import { Grid, List, Settings, Camera, UserPlus, UserMinus, MessageCircle, LogOut } from 'lucide-react'
 import { formatDistanceToNow } from 'date-fns'
