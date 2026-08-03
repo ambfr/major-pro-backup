@@ -9,6 +9,8 @@ import json
 import os
 from typing import List
 
+from ai.pipeline.loader import get_model
+
 logger = logging.getLogger("mindgram.rag")
 
 # Mental health knowledge base — curated supportive suggestions
@@ -44,7 +46,7 @@ KNOWLEDGE_BASE = [
      "suggestion": "Channel this energy into a meaningful goal. Setting a concrete intention now — while motivation is high — increases follow-through significantly."},
 
     # Crisis / high risk
-    {"id": 11, "context": "hopeless suicidal want to die can't go on",
+    {"id": 11, "context": "hopeless suicidal crisis want to die can't go on",
      "suggestion": "You are not alone, and help is available right now. Please reach out to iCall India (9152987821), Vandrevala Foundation (1860-2662-345), or text 'HELLO' to 741741. You matter."},
     {"id": 12, "context": "self harm hurting myself cutting pain",
      "suggestion": "Please reach out to a trusted person or professional immediately. iCall: 9152987821. Your pain is real and deserves care — from a trained professional who can truly help."},
@@ -72,28 +74,49 @@ KNOWLEDGE_BASE = [
      "suggestion": "Feeling lost about identity or purpose is a deeply human experience. Exploring values-based exercises (like the VIA Character Strengths survey — free online) can provide helpful clarity."},
 ]
 
-# Global FAISS index and metadata
+# Global RAG index and metadata
 _index = None
 _documents = []
+_use_faiss = False
+
+
+class _FallbackRAGIndex:
+    def __init__(self, embeddings: np.ndarray):
+        self.embeddings = embeddings
+        self.ntotal = embeddings.shape[0]
+
+    def search(self, query_vec: np.ndarray, top_k: int):
+        # query_vec shape: (n_queries, dim)
+        scores = self.embeddings @ query_vec.T
+        # faiss returns top-k distances and indices for each query
+        indices = np.argsort(-scores, axis=0)[:top_k].T
+        top_scores = np.take_along_axis(scores.T, indices, axis=1)
+        return top_scores, indices
 
 
 def build_rag_index():
     """Build FAISS index from knowledge base."""
-    global _index, _documents
-    import faiss
-    from ai.pipeline.loader import get_model
+    global _index, _documents, _use_faiss
 
     embedder = get_model("embedder")
     texts = [doc["context"] for doc in KNOWLEDGE_BASE]
     embeddings = embedder.encode(texts, show_progress_bar=False, normalize_embeddings=True)
     embeddings = np.array(embeddings, dtype=np.float32)
-
     dim = embeddings.shape[1]
-    _index = faiss.IndexFlatIP(dim)  # Inner product = cosine similarity on normalized vectors
-    _index.add(embeddings)
-    _documents = KNOWLEDGE_BASE
 
-    logger.info(f"RAG FAISS index built: {len(_documents)} documents, dim={dim}")
+    try:
+        import faiss
+    except ImportError:
+        logger.warning("faiss not installed; using numpy fallback RAG index")
+        _index = _FallbackRAGIndex(embeddings)
+        _use_faiss = False
+    else:
+        _index = faiss.IndexFlatIP(dim)  # Inner product = cosine similarity on normalized vectors
+        _index.add(embeddings)
+        _use_faiss = True
+
+    _documents = KNOWLEDGE_BASE
+    logger.info(f"RAG index built: {len(_documents)} documents, dim={dim}, faiss={_use_faiss}")
 
 
 def retrieve_suggestion(user_context: str, top_k: int = 1) -> str:
@@ -103,9 +126,8 @@ def retrieve_suggestion(user_context: str, top_k: int = 1) -> str:
     if _index is None:
         return "Take care of yourself. Reach out to a trusted person if you need support."
 
-    from ai.pipeline.loader import get_model
     embedder = get_model("embedder")
-
+    
     query_vec = embedder.encode([user_context], normalize_embeddings=True)
     query_vec = np.array(query_vec, dtype=np.float32)
 
@@ -123,7 +145,6 @@ def retrieve_top_k(user_context: str, top_k: int = 3) -> List[str]:
     if _index is None:
         return []
 
-    from ai.pipeline.loader import get_model
     embedder = get_model("embedder")
 
     query_vec = embedder.encode([user_context], normalize_embeddings=True)

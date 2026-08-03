@@ -9,7 +9,8 @@ import sys, os
 sys.path.insert(0, os.path.dirname(__file__))
 
 from models.database import create_tables, AsyncSessionLocal
-from models.models import User, Post, EmotionLog, AgentDecision
+from models.models import User, Post, PostMedia, EmotionLog, AgentDecision
+from services.topic_utils import extract_topics
 from datetime import datetime, timedelta
 import random
 
@@ -22,19 +23,19 @@ DEMO_USERS = [
 ]
 
 DEMO_POSTS = [
-    {"user_id": 2, "content": "Woke up early to watch the sunrise 🌅 feeling grateful for these small moments",
+    {"user_id": 2, "content": "Woke up early to watch the sunrise 🌅 feeling grateful for these small moments #gratitude #sunrise #wellness",
      "sentiment": "positive", "sentiment_score": 0.78, "emotion": "joy", "emotion_score": 0.82,
      "sarcasm": False, "risk_score": 0.05, "feed_score": 0.88, "likes_count": 143, "comments_count": 12,
      "image_url": "https://images.unsplash.com/photo-1506905925346-21bda4d32df4?w=600&q=80"},
-    {"user_id": 3, "content": "Everything feels so heavy lately. Can't seem to shake this fog.",
+    {"user_id": 3, "content": "Everything feels so heavy lately. Can't seem to shake this fog. #mentalhealth #sadness",
      "sentiment": "negative", "sentiment_score": -0.71, "emotion": "sadness", "emotion_score": 0.76,
      "sarcasm": False, "risk_score": 0.72, "feed_score": 0.22, "likes_count": 67, "comments_count": 34,
      "image_url": ""},
-    {"user_id": 4, "content": "Just finished a 10km run! 🏃 The endorphins are real.",
+    {"user_id": 4, "content": "Just finished a 10km run! 🏃 The endorphins are real. #fitness #running #wellness",
      "sentiment": "positive", "sentiment_score": 0.91, "emotion": "joy", "emotion_score": 0.88,
      "sarcasm": False, "risk_score": 0.02, "feed_score": 0.94, "likes_count": 221, "comments_count": 18,
      "image_url": "https://images.unsplash.com/photo-1506929562872-bb421503ef21?w=600&q=80"},
-    {"user_id": 5, "content": "Another rejection email. Yeah, totally fine, I love this!",
+    {"user_id": 5, "content": "Another rejection email. Yeah, totally fine, I love this! #jobsearch #sarcasm",
      "sentiment": "negative", "sentiment_score": -0.43, "emotion": "anger", "emotion_score": 0.61,
      "sarcasm": True,  "risk_score": 0.48, "feed_score": 0.31, "likes_count": 89, "comments_count": 27,
      "image_url": ""},
@@ -69,8 +70,17 @@ async def seed():
                 feed_score=p["feed_score"],
                 likes_count=p["likes_count"],
                 comments_count=p["comments_count"],
+                topics=extract_topics(p["content"], p["emotion"]),
                 created_at=datetime.utcnow() - timedelta(hours=i * 4),
             )
+            if p.get("image_url"):
+                post.media = [
+                    PostMedia(
+                        media_type="image",
+                        url=p["image_url"],
+                        position=0,
+                    )
+                ]
             db.add(post)
 
         # Emotion logs for user 1 (for dashboard charts)

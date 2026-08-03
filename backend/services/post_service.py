@@ -5,10 +5,12 @@ Decouples the router layer from direct DB + AI calls.
 
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
+from sqlalchemy.orm import selectinload
 from datetime import datetime
 
-from models.models import Post, User, EmotionLog, AgentDecision
+from models.models import Post, User, EmotionLog, AgentDecision, PostMedia
 from schemas.schemas import PostCreate, PipelineResult
+from services.topic_utils import extract_topics
 from ai.pipeline.analyzer import analyze_text
 from ai.agents.orchestrator import run_agents, EmotionSnapshot
 
@@ -72,6 +74,7 @@ async def create_post_with_ai(
         user_id=body.user_id,
         content=body.content,
         image_url=body.image_url or "",
+        video_url=body.video_url or "",
         is_reel=body.is_reel,
         sentiment=pipeline.sentiment,
         sentiment_score=pipeline.sentiment_score,
@@ -81,8 +84,17 @@ async def create_post_with_ai(
         sarcasm_score=pipeline.sarcasm_score,
         risk_score=pipeline.risk_score,
         feed_score=pipeline.feed_score,
+        topics=extract_topics(body.content, pipeline.emotion, body.location or ""),
     )
     db.add(post)
+    await db.flush()
+
+    media_items = []
+    if body.image_url:
+        media_items.append(PostMedia(media_type="image", url=body.image_url, position=0))
+    if body.video_url:
+        media_items.append(PostMedia(media_type="video", url=body.video_url, position=len(media_items)))
+    post.media = media_items
 
     # 3 — Emotion log
     log = EmotionLog(
@@ -94,7 +106,6 @@ async def create_post_with_ai(
         source="post",
     )
     db.add(log)
-    await db.flush()  # assign IDs
 
     # 4 — Agentic pipeline
     history = await get_emotion_snapshots(body.user_id, db)
@@ -128,6 +139,7 @@ async def fetch_user_posts(user_id: int, db: AsyncSession, limit: int = 20) -> l
     """Retrieve a user's posts ordered by recency."""
     result = await db.execute(
         select(Post)
+        .options(selectinload(Post.media))
         .where(Post.user_id == user_id)
         .order_by(Post.created_at.desc())
         .limit(limit)

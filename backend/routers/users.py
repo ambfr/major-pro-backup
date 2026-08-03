@@ -10,17 +10,110 @@ GET    /api/users/search             → search users
 """
 
 from datetime import datetime
+import bcrypt
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, or_
 from typing import Optional
+from pydantic import BaseModel, EmailStr
 
 from models.database import get_db
 from models.models import User, Follow, Post, Notification
-from routers.auth import get_current_user
+from routers.auth import get_current_user, get_optional_user
 from services.cloudinary_service import upload_avatar
 
 router = APIRouter()
+
+
+class UserCreateRequest(BaseModel):
+    username: str
+    display_name: str
+    email: Optional[EmailStr] = None
+    password: Optional[str] = None
+
+
+# ── Create User ───────────────────────────────────────────────
+
+@router.post("", status_code=201)
+async def create_user(body: UserCreateRequest, db: AsyncSession = Depends(get_db)):
+    # Ensure username is unique
+    result = await db.execute(select(User).where(User.username == body.username))
+    if result.scalar_one_or_none():
+        raise HTTPException(status_code=409, detail="Username already taken")
+
+    email = body.email
+    if email is None:
+        base_email = f"{body.username}@mindgram.test"
+        email = base_email
+        counter = 1
+        while True:
+            result = await db.execute(select(User).where(User.email == email))
+            if not result.scalar_one_or_none():
+                break
+            email = f"{body.username}+{counter}@mindgram.test"
+            counter += 1
+
+    result = await db.execute(select(User).where(User.email == email))
+    if result.scalar_one_or_none():
+        raise HTTPException(status_code=409, detail="Email already registered")
+
+    user = User(
+        username=body.username,
+        email=email,
+        display_name=body.display_name or body.username,
+        hashed_password=bcrypt.hashpw(body.password.encode(), bcrypt.gensalt()).decode() if body.password else None,
+        avatar_url=f"https://api.dicebear.com/9.x/avataaars/svg?seed={body.username}",
+    )
+    db.add(user)
+    await db.commit()
+    await db.refresh(user)
+
+    return {
+        "id": user.id,
+        "username": user.username,
+        "display_name": user.display_name,
+        "avatar_url": user.avatar_url,
+        "email": user.email,
+    }
+
+
+@router.get("")
+async def list_users(db: AsyncSession = Depends(get_db)):
+    result = await db.execute(select(User).limit(50))
+    users = result.scalars().all()
+    return [
+        {
+            "id": u.id,
+            "username": u.username,
+            "display_name": u.display_name,
+            "avatar_url": u.avatar_url,
+            "bio": u.bio,
+        }
+        for u in users
+    ]
+
+
+@router.get("/{user_id}")
+async def get_user_by_id(
+    user_id: int,
+    current_user: Optional[User] = Depends(get_optional_user),
+    db: AsyncSession = Depends(get_db),
+):
+    user = await db.get(User, user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    return {
+        "id": user.id,
+        "username": user.username,
+        "display_name": user.display_name,
+        "avatar_url": user.avatar_url,
+        "bio": user.bio,
+        "followers_count": user.followers_count,
+        "following_count": user.following_count,
+        "posts_count": user.posts_count,
+        "is_private": user.is_private,
+    }
 
 
 # ── Get Profile ───────────────────────────────────────────────

@@ -1,51 +1,76 @@
 """
 Posts Router
-POST /api/posts          → create post with image/video upload
-GET  /api/posts/{id}     → get single post
+POST /api/posts          → create post
+GET  /api/posts/{id}     → get post
 DELETE /api/posts/{id}   → delete post
 POST /api/posts/{id}/like → like/unlike post
 """
 
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
+from sqlalchemy.orm import selectinload
 from typing import Optional
-from datetime import datetime
 
 from models.database import get_db
 from models.models import (
-    Post, User, EmotionLog, AgentDecision,
-    Like, Notification
+    Post,
+    User,
+    EmotionLog,
+    AgentDecision,
+    Like,
+    PostMedia,
 )
-from schemas.schemas import PostOut
-from routers.auth import get_current_user
+
+from schemas.schemas import PostOut, UserOut
+from routers.auth import get_current_user, get_optional_user
+from services.algorithm import (
+    attach_like_status, update_user_interests, log_like_behavioral_signal,
+)
+from services.topic_utils import extract_topics
+
 from ai.pipeline.analyzer import analyze_text
 from ai.agents.orchestrator import run_agents, EmotionSnapshot
-from services.cloudinary_service import upload_image, upload_video, delete_asset
-from services.algorithm import update_user_interests
+from services.cloudinary_service import upload_image, upload_video
+from services.notification_service import create_notification
 
 router = APIRouter()
 
 
-async def get_user_risk_history(user_id: int, db: AsyncSession) -> list[float]:
+# --------------------------------------------------
+# Helper Functions
+# --------------------------------------------------
+
+async def get_user_risk_history(
+    user_id: int,
+    db: AsyncSession,
+) -> list[float]:
+
     result = await db.execute(
         select(EmotionLog.risk_score)
         .where(EmotionLog.user_id == user_id)
         .order_by(EmotionLog.timestamp.desc())
         .limit(20)
     )
+
     rows = result.scalars().all()
     return list(reversed(rows))
 
 
-async def get_emotion_history(user_id: int, db: AsyncSession) -> list[EmotionSnapshot]:
+async def get_emotion_history(
+    user_id: int,
+    db: AsyncSession,
+) -> list[EmotionSnapshot]:
+
     result = await db.execute(
         select(EmotionLog)
         .where(EmotionLog.user_id == user_id)
         .order_by(EmotionLog.timestamp.desc())
         .limit(20)
     )
+
     logs = result.scalars().all()
+
     return [
         EmotionSnapshot(
             sentiment_score=log.sentiment_score,
@@ -58,52 +83,132 @@ async def get_emotion_history(user_id: int, db: AsyncSession) -> list[EmotionSna
     ]
 
 
+# --------------------------------------------------
+# Create Post
+# --------------------------------------------------
+
 @router.post("", response_model=PostOut, status_code=201)
 async def create_post(
+    request: Request,
+    user_id: Optional[int] = Form(default=None),
     content: str = Form(default=""),
     location: str = Form(default=""),
     is_reel: bool = Form(default=False),
+    images: Optional[list[UploadFile]] = File(default=None),
     image: Optional[UploadFile] = File(default=None),
     video: Optional[UploadFile] = File(default=None),
-    current_user: User = Depends(get_current_user),
+    current_user: Optional[User] = Depends(get_optional_user),
     db: AsyncSession = Depends(get_db),
 ):
-    if not content and not image and not video:
+    content_type = request.headers.get("content-type", "").lower()
+    if "application/json" in content_type:
+        body = await request.json()
+        user_id = body.get("user_id", user_id)
+        content = body.get("content", content or "")
+        location = body.get("location", location or "")
+        is_reel = body.get("is_reel", is_reel)
+
+    if user_id is None:
+        raise HTTPException(status_code=400, detail="user_id is required")
+
+    user = await db.get(User, user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    if current_user and current_user.id != user_id:
+        raise HTTPException(status_code=403, detail="Cannot create a post for another user")
+
+    image_files = [file for file in (images or []) if file and file.filename]
+    if image and image.filename:
+        image_files.append(image)
+
+    if len(image_files) > 10:
+        raise HTTPException(status_code=400, detail="You can add up to 10 photos per post")
+
+    if image_files and video and video.filename:
+        raise HTTPException(status_code=400, detail="Use either a photo carousel or one video, not both")
+
+    if not content and not image_files and not (video and video.filename):
         raise HTTPException(
             status_code=400,
-            detail="Post must have content, image or video"
+            detail="Post must have content, image or video",
         )
 
-    image_url = ""
-    video_url = ""
-    image_public_id = ""
-    video_public_id = ""
+    uploaded_media = []
 
-    # Upload media to Cloudinary
-    if image and image.filename:
-        result = await upload_image(image, folder="mindgram/posts")
-        image_url = result["url"]
-        image_public_id = result["public_id"]
+    for position, image_file in enumerate(image_files):
+        result = await upload_image(
+            image_file,
+            folder="mindgram/posts",
+        )
+        uploaded_media.append({
+            "media_type": "image",
+            "url": result["url"],
+            "public_id": result["public_id"],
+            "position": position,
+        })
 
     if video and video.filename:
-        result = await upload_video(video, folder="mindgram/reels")
-        video_url = result["url"]
-        video_public_id = result["public_id"]
+        result = await upload_video(
+            video,
+            folder="mindgram/reels",
+        )
+        uploaded_media.append({
+            "media_type": "video",
+            "url": result["url"],
+            "public_id": result["public_id"],
+            "position": 0,
+        })
         is_reel = True
 
+    first_image = next((m for m in uploaded_media if m["media_type"] == "image"), None)
+    first_video = next((m for m in uploaded_media if m["media_type"] == "video"), None)
+
     # Run AI pipeline on caption (or a neutral default for image-only posts)
-    text_to_analyze = content.strip() or ("shared a photo" if image_url else "shared a video" if video_url else "photo post")
-    risk_history = await get_user_risk_history(current_user.id, db)
-    pipeline = analyze_text(text_to_analyze, risk_history)
+    text_to_analyze = content.strip() or (
+        "shared a photo carousel"
+        if len(image_files) > 1
+        else "shared a photo"
+        if first_image
+        else "shared a video"
+        if first_video
+        else "photo post"
+    )
+
+    # NOTE: text_to_analyze is a placeholder ("shared a photo") when there's
+    # no real caption -- it exists only so the sentiment/emotion classifiers
+    # have *something* to run on. It must NOT be used to decide whether the
+    # caption is "empty" (that placeholder has plenty of characters), and it
+    # was previously the only text passed to analyze_text, meaning:
+    #   1. media_source was never passed in at all, so blend_media_signal
+    #      always took its "no media" early-return branch -- image/video
+    #      analysis never influenced sentiment/risk/emotion.
+    #   2. even once media_source is wired in, the empty-caption bypass
+    #      inside the pipeline needs to see the REAL caption (`content`),
+    #      not the placeholder, or a captionless photo post would let the
+    #      placeholder's classifier output vote against the image's actual
+    #      emotion read.
+    media_url_for_analysis = (
+        first_image["url"] if first_image
+        else first_video["url"] if first_video
+        else None
+    )
+
+    risk_history = await get_user_risk_history(user.id, db)
+    pipeline = analyze_text(
+        text_to_analyze,
+        risk_history,
+        media_source=media_url_for_analysis,
+        original_content=content,
+    )
 
     # Create post
     post = Post(
-        user_id=current_user.id,
+        user_id=user.id,
         content=content,
-        image_url=image_url,
-        video_url=video_url,
-        image_public_id=image_public_id,
-        video_public_id=video_public_id,
+        image_url=first_image["url"] if first_image else "",
+        video_url=first_video["url"] if first_video else "",
+        image_public_id=first_image["public_id"] if first_image else "",
+        video_public_id=first_video["public_id"] if first_video else "",
         is_reel=is_reel,
         location=location,
         sentiment=pipeline.sentiment,
@@ -114,27 +219,47 @@ async def create_post(
         sarcasm_score=pipeline.sarcasm_score,
         risk_score=pipeline.risk_score,
         feed_score=pipeline.feed_score,
+        topics=extract_topics(content, pipeline.emotion, location),
     )
-    db.add(post)
 
-    # Log emotion
+    db.add(post)
+    await db.flush()  # assigns post.id, needed before creating PostMedia rows below
+
+    # IMPORTANT: don't do `post.media = [...]` here.
+    # Assigning a list to an async relationship forces SQLAlchemy to lazy-load
+    # the existing collection first to diff against it, which fires a sync-style
+    # query the async session can't service inline -> MissingGreenlet.
+    # Setting post_id explicitly and adding each row individually sidesteps
+    # the relationship's collection-loading logic entirely.
+    for item in uploaded_media:
+        db.add(PostMedia(
+            post_id=post.id,
+            media_type=item["media_type"],
+            url=item["url"],
+            public_id=item["public_id"],
+            position=item["position"],
+        ))
+
     log = EmotionLog(
-        user_id=current_user.id,
+        user_id=user.id,
         sentiment_score=pipeline.sentiment_score,
         emotion=pipeline.emotion,
         emotion_score=pipeline.emotion_score,
         risk_score=pipeline.risk_score,
         source="post",
     )
+
     db.add(log)
 
-    # Update post count
-    current_user.posts_count = (current_user.posts_count or 0) + 1
+    user.posts_count = (
+        user.posts_count or 0
+    ) + 1
 
-    await db.flush()
+    history = await get_emotion_history(
+        user.id,
+        db,
+    )
 
-    # Run agentic pipeline
-    history = await get_emotion_history(current_user.id, db)
     current_snap = EmotionSnapshot(
         sentiment_score=pipeline.sentiment_score,
         emotion=pipeline.emotion,
@@ -142,112 +267,39 @@ async def create_post(
         risk_score=pipeline.risk_score,
         source="post",
     )
-    agent_report = run_agents(current_snap, history)
 
-    # Save agent decision
-    db.add(AgentDecision(
-        user_id=current_user.id,
-        risk_level=agent_report.risk_level,
-        decision=agent_report.decision,
-        intervention=agent_report.intervention,
-        rag_suggestion=agent_report.rag_suggestion,
-        metadata_json=agent_report.metadata,
-    ))
+    agent_report = run_agents(
+        current_snap,
+        history,
+    )
+
+    db.add(
+        AgentDecision(
+            user_id=user.id,
+            risk_level=agent_report.risk_level,
+            decision=agent_report.decision,
+            intervention=agent_report.intervention,
+            rag_suggestion=agent_report.rag_suggestion,
+            metadata_json=agent_report.metadata,
+        )
+    )
+
     log.agent_action = agent_report.decision
 
     await db.commit()
-    await db.refresh(post)
-    post.author = current_user
+
+    # Explicitly (re)load the media relationship via an awaited query instead
+    # of a plain db.refresh(post), which would NOT reload `media` and could
+    # trigger the same MissingGreenlet error later when PostOut serializes
+    # post.media (an implicit lazy-load on the way out).
+    await db.refresh(post, attribute_names=["media"])
+
+    post.author = user
+
     return post
-
-
-@router.get("/{post_id}", response_model=PostOut)
-async def get_post(
-    post_id: int,
-    db: AsyncSession = Depends(get_db),
-):
-    post = await db.get(Post, post_id)
-    if not post:
-        raise HTTPException(status_code=404, detail="Post not found")
-    post.author = await db.get(User, post.user_id)
-    return post
-
-
-@router.delete("/{post_id}")
-async def delete_post(
-    post_id: int,
-    current_user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
-):
-    post = await db.get(Post, post_id)
-    if not post:
-        raise HTTPException(status_code=404, detail="Post not found")
-    if post.user_id != current_user.id:
-        raise HTTPException(status_code=403, detail="Not your post")
-
-    # Clean up Cloudinary storage before deleting the DB row.
-    # Best-effort: delete_asset() already swallows its own errors,
-    # so a Cloudinary hiccup never blocks the actual post deletion.
-    if post.image_public_id:
-        delete_asset(post.image_public_id, resource_type="image")
-    if post.video_public_id:
-        delete_asset(post.video_public_id, resource_type="video")
-
-    await db.delete(post)
-    current_user.posts_count = max(0, (current_user.posts_count or 1) - 1)
-    await db.commit()
-    return {"status": "deleted"}
-
-
-@router.post("/{post_id}/like")
-async def toggle_like(
-    post_id: int,
-    current_user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
-):
-    post = await db.get(Post, post_id)
-    if not post:
-        raise HTTPException(status_code=404, detail="Post not found")
-
-    # Check if already liked
-    result = await db.execute(
-        select(Like).where(
-            Like.post_id == post_id,
-            Like.user_id == current_user.id,
-        )
-    )
-    existing = result.scalar_one_or_none()
-
-    if existing:
-        # Unlike
-        await db.delete(existing)
-        post.likes_count = max(0, post.likes_count - 1)
-        action = "unliked"
-    else:
-        # Like
-        db.add(Like(post_id=post_id, user_id=current_user.id))
-        post.likes_count += 1
-        action = "liked"
-
-        # Update user interests based on post emotion
-        await update_user_interests(current_user.id, post.emotion, db)
-
-        # Notify post author
-        if post.user_id != current_user.id:
-            db.add(Notification(
-                user_id=post.user_id,
-                from_user_id=current_user.id,
-                type="like",
-                message=f"{current_user.username} liked your post",
-                post_id=post_id,
-            ))
-
-    await db.commit()
-    return {
-        "status": action,
-        "likes_count": post.likes_count,
-    }
-
+# --------------------------------------------------
+# Get User Posts
+# --------------------------------------------------
 
 @router.get("/user/{user_id}", response_model=list[PostOut])
 async def get_user_posts(
@@ -256,8 +308,238 @@ async def get_user_posts(
     offset: int = 0,
     db: AsyncSession = Depends(get_db),
 ):
+    """
+    Get all posts of a user.
+    """
+
     result = await db.execute(
         select(Post)
+        .options(selectinload(Post.media))
+        .where(Post.user_id == user_id)
+        .order_by(Post.created_at.desc())
+        .limit(limit)
+        .offset(offset)
+    )
+
+    posts = result.scalars().all()
+
+    user = await db.get(User, user_id)
+
+    for post in posts:
+        post.author = user
+
+    return posts
+# --------------------------------------------------
+# Get Single Post
+# --------------------------------------------------
+
+@router.get("/{post_id}", response_model=PostOut)
+async def get_post(
+    post_id: int,
+    current_user: Optional[User] = Depends(get_optional_user),
+    db: AsyncSession = Depends(get_db),
+):
+
+    result = await db.execute(
+        select(Post)
+        .options(selectinload(Post.media))
+        .where(Post.id == post_id)
+    )
+    post = result.scalar_one_or_none()
+
+    if not post:
+        raise HTTPException(
+            status_code=404,
+            detail="Post not found",
+        )
+
+    post.author = await db.get(User, post.user_id)
+    if current_user:
+        await attach_like_status([post], current_user.id, db)
+
+    return post
+    
+
+
+# --------------------------------------------------
+# Delete Post
+# --------------------------------------------------
+
+@router.delete("/{post_id}")
+async def delete_post(
+    post_id: int,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+
+    result = await db.execute(
+        select(Post)
+        .options(selectinload(Post.media))
+        .where(Post.id == post_id)
+    )
+    post = result.scalar_one_or_none()
+
+    if not post:
+        raise HTTPException(
+            status_code=404,
+            detail="Post not found",
+        )
+
+    if post.user_id != current_user.id:
+        raise HTTPException(
+            status_code=403,
+            detail="Not your post",
+        )
+
+    # Clean up Cloudinary storage before deleting the DB row.
+    # Best-effort: delete_asset() already swallows its own errors,
+    # so a Cloudinary hiccup never blocks the actual post deletion.
+    for media in post.media:
+        delete_asset(media.public_id, resource_type=media.media_type)
+
+    if not post.media and post.image_public_id:
+        delete_asset(post.image_public_id, resource_type="image")
+    if not post.media and post.video_public_id:
+        delete_asset(post.video_public_id, resource_type="video")
+
+    await db.delete(post)
+
+    current_user.posts_count = max(
+        0,
+        (current_user.posts_count or 1) - 1,
+    )
+
+    await db.commit()
+
+    return {
+        "status": "deleted",
+    }
+
+
+# --------------------------------------------------
+# Like / Unlike Post
+# --------------------------------------------------
+
+@router.post("/{post_id}/like")
+async def toggle_like(
+    post_id: int,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+
+    post = await db.get(Post, post_id)
+
+    if not post:
+        raise HTTPException(
+            status_code=404,
+            detail="Post not found",
+        )
+
+    result = await db.execute(
+        select(Like).where(
+            Like.post_id == post_id,
+            Like.user_id == current_user.id,
+        )
+    )
+
+    existing = result.scalar_one_or_none()
+
+    if existing:
+
+        # Unlike
+        await db.delete(existing)
+
+        post.likes_count = max(
+            0,
+            post.likes_count - 1,
+        )
+
+        action = "unliked"
+
+    else:
+
+        # Like
+        like = Like(
+            post_id=post_id,
+            user_id=current_user.id,
+        )
+
+        db.add(like)
+
+        post.likes_count += 1
+
+        action = "liked"
+
+        # Update recommendation algorithm
+        await update_user_interests(
+            current_user.id,
+            post.emotion,
+            db,
+        )
+
+        # Create notification
+        if post.user_id != current_user.id:
+
+            await create_notification(
+                db=db,
+                user_id=post.user_id,
+                from_user_id=current_user.id,
+                notification_type="like",
+                message=f"{current_user.username} liked your post",
+                post_id=post_id,
+            )
+
+    await db.commit()
+
+    if action == "liked":
+        # Behavioral signal: liking is content-less, so this logs the
+        # LIKED POST's existing emotion/risk into the LIKER's own risk
+        # trajectory rather than re-running analyze_text (nothing to
+        # analyze). Runs after the like is committed so it never blocks
+        # the like itself. See services/algorithm.py for details.
+        await log_like_behavioral_signal(current_user.id, post, db)
+
+
+    return {
+        "status": action,
+        "is_liked": action == "liked",
+        "likes_count": post.likes_count,
+    }
+    
+
+@router.get("/{post_id}/likes", response_model=list[UserOut])
+async def get_post_likers(
+    post_id: int,
+    limit: int = 50,
+    offset: int = 0,
+    db: AsyncSession = Depends(get_db),
+):
+    """List of users who liked this post, most recent first."""
+    post = await db.get(Post, post_id)
+    if not post:
+        raise HTTPException(status_code=404, detail="Post not found")
+
+    result = await db.execute(
+        select(User)
+        .join(Like, Like.user_id == User.id)
+        .where(Like.post_id == post_id)
+        .order_by(Like.created_at.desc())
+        .limit(limit)
+        .offset(offset)
+    )
+    return result.scalars().all()
+
+@router.get("/user/{user_id}", response_model=list[PostOut])
+async def get_user_posts(
+    user_id: int,
+    limit: int = 20,
+    offset: int = 0,
+    current_user: Optional[User] = Depends(get_optional_user),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(
+        select(Post)
+        .options(selectinload(Post.media))
         .where(Post.user_id == user_id)
         .order_by(Post.created_at.desc())
         .limit(limit)
@@ -267,4 +549,6 @@ async def get_user_posts(
     user = await db.get(User, user_id)
     for p in posts:
         p.author = user
+    if current_user:
+        await attach_like_status(posts, current_user.id, db)
     return posts

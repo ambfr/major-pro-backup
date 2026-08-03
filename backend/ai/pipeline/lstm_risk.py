@@ -19,7 +19,7 @@ def build_lstm_model():
     """Build and return a compiled Keras LSTM model."""
     import tensorflow as tf
     from tensorflow import keras
-    from keras import layers
+    from tensorflow.keras import layers
 
     model = keras.Sequential([
         layers.Input(shape=(SEQ_LEN, 1)),
@@ -82,7 +82,7 @@ def generate_synthetic_training_data(n_samples: int = 5000):
 
 def train_and_save_lstm():
     """Train LSTM on synthetic data and save to disk."""
-    from keras.callbacks import EarlyStopping, ModelCheckpoint
+    from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint
 
     logger.info("Training LSTM on synthetic data...")
     X, y = generate_synthetic_training_data(n_samples=8000)
@@ -114,7 +114,7 @@ def train_and_save_lstm():
 def build_or_load_lstm():
     """Load from disk if exists, else train from scratch."""
     if os.path.exists(MODEL_PATH):
-        import keras
+        from tensorflow import keras
         logger.info(f"Loading LSTM from {MODEL_PATH}")
         return keras.models.load_model(MODEL_PATH)
     else:

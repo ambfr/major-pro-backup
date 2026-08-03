@@ -1,46 +1,69 @@
-# ── Web Framework ──────────────────────────────────────────
+# ==========================================================
+# MindGram Requirements
+# ==========================================================
+
+# ---------- FastAPI ----------
 fastapi==0.111.0
 uvicorn[standard]==0.29.0
 python-multipart==0.0.9
 
-# ── Database ───────────────────────────────────────────────
+# ---------- Database ----------
 sqlalchemy==2.0.30
 aiosqlite==0.20.0
 databases==0.9.0
 
-# ── Validation ─────────────────────────────────────────────
+# ---------- Validation ----------
 pydantic==2.7.1
 pydantic-settings==2.2.1
 email-validator==2.1.1
 
-# ── AI / NLP ───────────────────────────────────────────────
+# ---------- Authentication ----------
+PyJWT==2.10.1
+python-dotenv==1.2.2
+bcrypt==5.0.0
+passlib[bcrypt]==1.7.4
+
+# ---------- Google OAuth ----------
+google-auth==2.40.3
+google-auth-oauthlib==1.2.2
+google-auth-httplib2==0.2.0
+
+# ---------- AI / NLP ----------
 torch==2.2.2
 transformers==4.40.1
 tokenizers==0.19.1
 sentence-transformers==2.7.0
 accelerate==0.30.0
 
-# ── TensorFlow / Keras (LSTM) ──────────────────────────────
+# ---------- TensorFlow / LSTM ----------
 tensorflow==2.16.1
 keras==3.3.3
 numpy==1.26.4
-scikit-learn==1.4.2
+pandas==2.2.2
 
-# ── FAISS ─────────────────────────────────────────────────
+# ---------- Machine Learning ----------
+scikit-learn==1.4.2
+scipy==1.13.0
+
+# ---------- FAISS ----------
 faiss-cpu==1.8.0
 
-# ── Data & Utilities ──────────────────────────────────────
-pandas==2.2.2
-python-dateutil==2.9.0
+# ---------- Image Processing ----------
+Pillow==10.3.0
+
+# ---------- HTTP ----------
+requests==2.32.3
 httpx==0.27.0
-aiofiles==23.2.1
 
-# ── CORS / Auth ───────────────────────────────────────────
-python-jose[cryptography]==3.3.0
-passlib[bcrypt]==1.7.4
+# ---------- Cloudinary ----------
+cloudinary==1.39.1
 
-# ── Dev ───────────────────────────────────────────────────
-pytest==8.2.0
-pytest-asyncio==0.23.6
-#--------------------------------------
-cloudinary
+# ---------- Environment ----------
+python-dateutil==2.9.0.post0
+
+# ---------- Utilities ----------
+tqdm==4.66.4
+
+# ---------- ASGI ----------
+anyio==4.4.0
+starlette==0.37.2

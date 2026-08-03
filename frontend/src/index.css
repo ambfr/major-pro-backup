@@ -68,3 +68,25 @@
   padding: 2px;
   border-radius: 50%;
 }
+
+/* Carousel nav buttons */
+.carousel-nav-btn {
+  position: absolute;
+  top: 50%;
+  z-index: 20;
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+  background: rgba(0, 0, 0, 0.55);
+  backdrop-filter: blur(6px);
+  color: #fff;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  cursor: pointer;
+  transition: opacity 0.2s ease, transform 0.2s ease, background 0.15s ease;
+}
+.carousel-nav-btn:hover {
+  background: rgba(0, 0, 0, 0.78);
+}

@@ -1,11 +1,12 @@
 import React, { useState, useEffect, useRef } from 'react'
-import { useParams } from 'react-router-dom'
-import { useParams , useNavigate} from 'react-router-dom'
+import { useParams, useNavigate } from 'react-router-dom'
 import { Grid, List, Settings, Camera, UserPlus, UserMinus, MessageCircle, LogOut } from 'lucide-react'
 import { formatDistanceToNow } from 'date-fns'
 import clsx from 'clsx'
 import { useAuth } from '../../context/AuthContext.jsx'
 import { EmotionBadge, SentimentBar, RiskBadge } from '../Common/Badges.jsx'
+import MediaCarousel from '../Common/MediaCarousel.jsx'
+import { getPostMedia, getPostThumbnail } from '../../utils/postMedia.js'
 
 export default function ProfilePage() {
   const { username }            = useParams()
@@ -21,9 +22,13 @@ export default function ProfilePage() {
   const [editing, setEditing]   = useState(false)
   const [editForm, setEditForm] = useState({ display_name: '', bio: '', username: '' })
   const [usernameError, setUsernameError] = useState('')
-  const [listModal, setListModal] = useState(null)   // 'followers' | 'following' | null
+  const [listModal, setListModal] = useState(null)   // 'followers' | 'following' | 'likes' | null
   const [listUsers, setListUsers] = useState([])
   const [listLoading, setListLoading] = useState(false)
+  const [postComments, setPostComments] = useState([])
+  const [commentsLoading, setCommentsLoading] = useState(false)
+  const [newComment, setNewComment] = useState('')
+  const [postingComment, setPostingComment] = useState(false)
 
   const openList = async (type) => {
     if (!profile) return
@@ -38,6 +43,57 @@ export default function ProfilePage() {
       setListLoading(false)
     }
   }
+
+  const openLikers = async (post) => {
+    setListModal('likes')
+    setListLoading(true)
+    try {
+      const res = await api.get(`/posts/${post.id}/likes`)
+      setListUsers(res.data || [])
+    } catch {
+      setListUsers([])
+    } finally {
+      setListLoading(false)
+    }
+  }
+
+  const loadPostComments = async (postId) => {
+    setCommentsLoading(true)
+    try {
+      const res = await api.get(`/interactions/comments/${postId}`)
+      setPostComments(res.data || [])
+    } catch {
+      setPostComments([])
+    } finally {
+      setCommentsLoading(false)
+    }
+  }
+
+  const handleAddComment = async () => {
+    if (!newComment.trim() || !selected) return
+    setPostingComment(true)
+    try {
+      const res = await api.post('/interactions/comment', {
+        post_id: selected.id,
+        user_id: user.id,
+        content: newComment.trim(),
+      })
+      setPostComments(c => [...c, res.data])
+      setNewComment('')
+    } catch {
+    } finally {
+      setPostingComment(false)
+    }
+  }
+
+  useEffect(() => {
+    if (selected) {
+      loadPostComments(selected.id)
+    } else {
+      setPostComments([])
+      setNewComment('')
+    }
+  }, [selected])
   const fileRef = useRef()
 
   const isOwn = !username || username === user?.username
@@ -47,24 +103,36 @@ export default function ProfilePage() {
     if (!target) return
 
     setLoading(true)
-    Promise.all([
-      isOwn
-        ? api.get('/users/me')
-        : api.get(`/users/${target}`),
-      api.get(`/posts/user/${isOwn ? user?.id : 0}`).catch(() => ({ data: [] })),
-      isOwn ? api.get(`/analytics/${user?.id}`).catch(() => ({ data: null })) : Promise.resolve({ data: null }),
-      isOwn ? api.get(`/agents/status/${user?.id}`).catch(() => ({ data: null })) : Promise.resolve({ data: null }),
-    ]).then(([profileRes, postsRes, analyticsRes, agentRes]) => {
-      setProfile(profileRes.data)
-      setPosts(postsRes.data || [])
-      setAnalytics(analyticsRes.data)
-      setAgentStatus(agentRes.data)
-      setEditForm({
-        display_name: profileRes.data.display_name || '',
-        bio: profileRes.data.bio || '',
-        username: profileRes.data.username || '',
-      })
-    }).finally(() => setLoading(false))
+
+    // Profile must be fetched FIRST — the posts/analytics/agent-status calls
+    // all need the resolved profile.id (for other users' profiles, we don't
+    // know their id until this resolves; user?.id only works for isOwn).
+    ;(async () => {
+      try {
+        const profileRes = await (isOwn ? api.get('/users/me') : api.get(`/users/${target}`))
+        const profileData = profileRes.data
+        setProfile(profileData)
+        setEditForm({
+          display_name: profileData.display_name || '',
+          bio: profileData.bio || '',
+          username: profileData.username || '',
+        })
+
+        const targetId = profileData.id
+
+        const [postsRes, analyticsRes, agentRes] = await Promise.all([
+          api.get(`/posts/user/${targetId}`).catch(() => ({ data: [] })),
+          isOwn ? api.get(`/analytics/${targetId}`).catch(() => ({ data: null })) : Promise.resolve({ data: null }),
+          isOwn ? api.get(`/agents/status/${targetId}`).catch(() => ({ data: null })) : Promise.resolve({ data: null }),
+        ])
+
+        setPosts(postsRes.data || [])
+        setAnalytics(analyticsRes.data)
+        setAgentStatus(agentRes.data)
+      } finally {
+        setLoading(false)
+      }
+    })()
   }, [username, user])
 
   const handleFollow = async () => {
@@ -330,44 +398,43 @@ export default function ProfilePage() {
       {viewMode === 'grid' ? (
         <>
           <div className="grid grid-cols-3 gap-1">
-            {posts.map(post => (
-              <button
-                key={post.id}
-                onClick={() => setSelected(post)}
-                className="relative aspect-square overflow-hidden rounded-lg bg-white/5 group"
-              >
-                {post.image_url ? (
-                  <img
-                    src={post.image_url}
-                    alt=""
-                    className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-300"
-                    loading="lazy"
-                  />
-                ) : (
-                  <div className="w-full h-full flex items-center justify-center p-2 bg-white/3">
-                    <p className="text-[10px] text-gray-400 text-center line-clamp-4 leading-relaxed">
-                      {post.content}
-                    </p>
+            {posts.map(post => {
+              const media = getPostMedia(post)
+              const thumb = media[0]
+              return (
+                <button
+                  key={post.id}
+                  onClick={() => setSelected(post)}
+                  className="relative aspect-square overflow-hidden rounded-lg bg-white/5 group"
+                >
+                  {thumb ? (
+                    <MediaCarousel media={media} variant="thumbnail" className="group-hover:scale-105 transition-transform duration-300" />
+                  ) : (
+                    <div className="w-full h-full flex items-center justify-center p-2 bg-white/3">
+                      <p className="text-[10px] text-gray-400 text-center line-clamp-4 leading-relaxed">
+                        {post.content}
+                      </p>
+                    </div>
+                  )}
+                  <div className="absolute inset-0 bg-black/60 opacity-0 group-hover:opacity-100
+                                  transition-opacity flex items-center justify-center gap-3">
+                    <span className="flex items-center gap-1 text-white text-xs font-medium">
+                      ❤️ {post.likes_count}
+                    </span>
+                    <span className="flex items-center gap-1 text-white text-xs font-medium">
+                      💬 {post.comments_count}
+                    </span>
                   </div>
-                )}
-                <div className="absolute inset-0 bg-black/60 opacity-0 group-hover:opacity-100
-                                transition-opacity flex items-center justify-center gap-3">
-                  <span className="flex items-center gap-1 text-white text-xs font-medium">
-                    ❤️ {post.likes_count}
-                  </span>
-                  <span className="flex items-center gap-1 text-white text-xs font-medium">
-                    💬 {post.comments_count}
-                  </span>
-                </div>
-                {/* Risk dot */}
-                <div className={clsx(
-                  'absolute top-1 right-1 w-2 h-2 rounded-full',
-                  post.risk_score > 0.5 ? 'bg-red-400'
-                  : post.risk_score > 0.3 ? 'bg-yellow-400'
-                  : 'bg-green-400'
-                )} />
-              </button>
-            ))}
+                  {/* Risk dot */}
+                  <div className={clsx(
+                    'absolute top-1 right-1 w-2 h-2 rounded-full',
+                    post.risk_score > 0.5 ? 'bg-red-400'
+                    : post.risk_score > 0.3 ? 'bg-yellow-400'
+                    : 'bg-green-400'
+                  )} />
+                </button>
+              )
+            })}
           </div>
 
           {posts.length === 0 && (
@@ -378,32 +445,33 @@ export default function ProfilePage() {
         </>
       ) : (
         <div className="space-y-3">
-          {posts.map(post => (
-            <div key={post.id} className="card p-4 flex gap-4">
-              {post.image_url && (
-                <img
-                  src={post.image_url}
-                  alt=""
-                  className="w-16 h-16 rounded-xl object-cover flex-shrink-0"
-                />
-              )}
-              <div className="flex-1 min-w-0">
-                <p className="text-sm text-gray-200 leading-relaxed line-clamp-2 mb-2">
-                  {post.content}
-                </p>
-                <div className="flex items-center gap-2 flex-wrap">
-                  <EmotionBadge emotion={post.emotion} size="sm" />
-                  {post.sarcasm && (
-                    <span className="text-[10px] text-purple-300">🎭 sarcasm</span>
-                  )}
-                  <span className="ml-auto flex items-center gap-2 text-xs text-gray-500">
-                    <span>❤️ {post.likes_count}</span>
-                    <span>💬 {post.comments_count}</span>
-                  </span>
+          {posts.map(post => {
+            const thumb = getPostThumbnail(post)
+            return (
+              <div key={post.id} className="card p-4 flex gap-4">
+                {thumb && (
+                  <div className="w-16 h-16 rounded-xl overflow-hidden flex-shrink-0">
+                    <MediaCarousel media={[thumb]} variant="thumbnail" />
+                  </div>
+                )}
+                <div className="flex-1 min-w-0">
+                  <p className="text-sm text-gray-200 leading-relaxed line-clamp-2 mb-2">
+                    {post.content}
+                  </p>
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <EmotionBadge emotion={post.emotion} size="sm" />
+                    {post.sarcasm && (
+                      <span className="text-[10px] text-purple-300">🎭 sarcasm</span>
+                    )}
+                    <span className="ml-auto flex items-center gap-2 text-xs text-gray-500">
+                      <span>❤️ {post.likes_count}</span>
+                      <span>💬 {post.comments_count}</span>
+                    </span>
+                  </div>
                 </div>
               </div>
-            </div>
-          ))}
+            )
+          })}
         </div>
       )}
 
@@ -415,7 +483,7 @@ export default function ProfilePage() {
           onClick={() => setSelected(null)}
         >
           <div
-            className="card max-w-md w-full p-5 space-y-4 animate-slide-up"
+            className="card max-w-md w-full p-5 space-y-4 animate-slide-up max-h-[85vh] overflow-y-auto"
             onClick={e => e.stopPropagation()}
           >
             <div className="flex items-center justify-between">
@@ -426,14 +494,23 @@ export default function ProfilePage() {
                 </span>
               )}
             </div>
-            {selected.image_url && (
-              <img
-                src={selected.image_url}
-                alt=""
-                className="w-full rounded-xl object-cover max-h-48"
-              />
+            {getPostMedia(selected).length > 0 && (
+              <MediaCarousel media={getPostMedia(selected)} className="max-h-64" />
             )}
             <p className="text-sm text-gray-200 leading-relaxed">{selected.content}</p>
+
+            <div className="flex items-center gap-4 pt-2 border-t border-white/10 text-xs">
+              <button
+                onClick={() => openLikers(selected)}
+                className="text-gray-400 hover:text-white transition-colors"
+              >
+                <span className="text-white font-semibold">{selected.likes_count || 0}</span> likes
+              </button>
+              <span className="text-gray-400">
+                <span className="text-white font-semibold">{selected.comments_count || 0}</span> comments
+              </span>
+            </div>
+
             <div className="space-y-2 pt-2 border-t border-white/10">
               <div className="flex items-center justify-between text-xs">
                 <span className="text-gray-500">Sentiment</span>
@@ -459,6 +536,54 @@ export default function ProfilePage() {
                 </span>
               </div>
             </div>
+
+            <div className="pt-2 border-t border-white/10 space-y-3 max-h-48 overflow-y-auto">
+              {commentsLoading ? (
+                <div className="flex items-center justify-center py-4">
+                  <div className="w-5 h-5 border-2 border-brand-500/30 border-t-brand-500 rounded-full animate-spin" />
+                </div>
+              ) : postComments.length === 0 ? (
+                <p className="text-gray-500 text-xs text-center py-3">No comments yet</p>
+              ) : (
+                postComments.map(c => (
+                  <div key={c.id} className="flex items-start gap-2">
+                    <img
+                      src={c.user?.avatar_url || `https://api.dicebear.com/9.x/avataaars/svg?seed=${c.user_id}`}
+                      alt=""
+                      className="w-7 h-7 rounded-full bg-gray-800 flex-shrink-0"
+                    />
+                    <div className="min-w-0">
+                      <p className="text-xs text-gray-200">
+                        <span className="text-white font-medium">{c.user?.username || `user_${c.user_id}`}</span>{' '}
+                        {c.content}
+                      </p>
+                      <p className="text-[10px] text-gray-500 mt-0.5">
+                        {formatDistanceToNow(new Date(c.created_at), { addSuffix: true })}
+                      </p>
+                    </div>
+                  </div>
+                ))
+              )}
+            </div>
+
+            <div className="flex items-center gap-2 pt-2 border-t border-white/10">
+              <input
+                value={newComment}
+                onChange={e => setNewComment(e.target.value)}
+                onKeyDown={e => e.key === 'Enter' && handleAddComment()}
+                placeholder="Add a comment..."
+                className="flex-1 bg-white/5 rounded-lg px-3 py-2 text-xs text-white placeholder-gray-500
+                           outline-none focus:ring-1 focus:ring-brand-500/50"
+              />
+              <button
+                onClick={handleAddComment}
+                disabled={!newComment.trim() || postingComment}
+                className="btn-primary text-xs py-2 px-3 disabled:opacity-40"
+              >
+                Post
+              </button>
+            </div>
+
             <button
               onClick={() => setSelected(null)}
               className="btn-ghost w-full text-sm"

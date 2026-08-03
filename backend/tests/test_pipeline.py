@@ -4,6 +4,7 @@ Unit tests for the AI analysis pipeline.
 These tests mock the HuggingFace models so they run without GPU/downloads.
 """
 
+import numpy as np
 import pytest
 from unittest.mock import patch, MagicMock
 
@@ -144,14 +145,21 @@ class TestAnalyzeText:
         sarcasm_mock   = MagicMock(return_value=[{"label": "non_irony", "score": 0.9}])
 
         def side_effect(name):
-            if name == "sentiment": return sentiment_mock
-            if name == "emotion":   return emotion_mock
-            if name == "sarcasm":   return sarcasm_mock
+            if name == "sentiment":
+                return sentiment_mock
+            if name == "emotion":
+                return emotion_mock
+            if name == "sarcasm":
+                return sarcasm_mock
             if name == "lstm":
                 m = MagicMock()
                 import numpy as np
                 m.predict = MagicMock(return_value=np.array([[0.65]]))
                 return m
+            if name == "embedder":
+                embedder = MagicMock()
+                embedder.encode = MagicMock(side_effect=lambda texts, normalize_embeddings=True, show_progress_bar=False: np.zeros((len(texts), 8), dtype=np.float32))
+                return embedder
 
         return patch("ai.pipeline.analyzer.get_model", side_effect=side_effect)
 

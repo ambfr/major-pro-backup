@@ -7,6 +7,8 @@ All AI pipeline calls are mocked so tests run without GPU.
 import pytest
 from unittest.mock import patch, MagicMock
 from schemas.schemas import PipelineResult
+from main import app
+from routers.auth import get_current_user
 
 
 # ── Shared mock pipeline result ──────────────────────────────
@@ -249,6 +251,85 @@ class TestAnalyticsEndpoints:
         assert resp.status_code == 200
         data = resp.json()
         assert "suggestions" in data
+
+
+# ── Notifications ─────────────────────────────────────────────
+
+@pytest.mark.asyncio
+class TestNotificationsEndpoints:
+    async def test_get_notifications(self, client, db_session, seeded_user):
+        from models.models import Notification
+
+        notification = Notification(
+            user_id=seeded_user.id,
+            from_user_id=None,
+            type="follow",
+            message="You have a new follower",
+        )
+        db_session.add(notification)
+        await db_session.commit()
+
+        async def override_get_current_user():
+            return seeded_user
+
+        app.dependency_overrides[get_current_user] = override_get_current_user
+        try:
+            resp = await client.get("/api/notifications")
+            assert resp.status_code == 200
+            data = resp.json()
+            assert isinstance(data, list)
+            assert len(data) == 1
+            assert data[0]["message"] == "You have a new follower"
+        finally:
+            app.dependency_overrides.pop(get_current_user, None)
+
+    async def test_mark_notification_read(self, client, db_session, seeded_user):
+        from models.models import Notification
+
+        notification = Notification(
+            user_id=seeded_user.id,
+            from_user_id=None,
+            type="comment",
+            message="Someone commented on your post",
+        )
+        db_session.add(notification)
+        await db_session.commit()
+        await db_session.refresh(notification)
+
+        async def override_get_current_user():
+            return seeded_user
+
+        app.dependency_overrides[get_current_user] = override_get_current_user
+        try:
+            resp = await client.put(f"/api/notifications/{notification.id}/read")
+            assert resp.status_code == 200
+            assert resp.json()["is_read"] is True
+        finally:
+            app.dependency_overrides.pop(get_current_user, None)
+
+    async def test_delete_notification(self, client, db_session, seeded_user):
+        from models.models import Notification
+
+        notification = Notification(
+            user_id=seeded_user.id,
+            from_user_id=None,
+            type="like",
+            message="Your post was liked",
+        )
+        db_session.add(notification)
+        await db_session.commit()
+        await db_session.refresh(notification)
+
+        async def override_get_current_user():
+            return seeded_user
+
+        app.dependency_overrides[get_current_user] = override_get_current_user
+        try:
+            resp = await client.delete(f"/api/notifications/{notification.id}")
+            assert resp.status_code == 200
+            assert resp.json()["success"] is True
+        finally:
+            app.dependency_overrides.pop(get_current_user, None)
 
 
 # ── Agents ───────────────────────────────────────────────────

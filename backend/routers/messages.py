@@ -1,7 +1,8 @@
+
 """
 Messages Router — Real-time WebSocket chat
 GET  /api/messages/conversations     → list conversations
-GET  /api/messages/thread/{user_id}  → get message thread
+GET  /api/messages/thread/{user_id}/{other_user_id}  → get message thread
 POST /api/messages                   → send message (REST fallback)
 WS   /api/messages/ws/{user_id}      → WebSocket live chat
 """
@@ -10,14 +11,15 @@ from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisco
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, or_, and_
 from typing import Dict, List
-from datetime import datetime
 import json
-
+from services.notification_service import create_notification
 from models.database import get_db
-from models.models import Message, User, EmotionLog, Notification, Follow
+from models.models import Message, User, Follow, EmotionLog, Notification, AgentDecision
 from schemas.schemas import MessageCreate, MessageOut
-from routers.auth import get_current_user
+from routers.auth import get_current_user, get_optional_user
 from ai.pipeline.analyzer import analyze_text
+from ai.agents.orchestrator import run_agents, EmotionSnapshot
+from routers.posts import get_user_risk_history, get_emotion_history
 
 router = APIRouter()
 
@@ -36,6 +38,56 @@ async def are_mutual_followers(db: AsyncSession, user_a_id: int, user_b_id: int)
     a_follows_b = any(f.follower_id == user_a_id and f.following_id == user_b_id for f in follows)
     b_follows_a = any(f.follower_id == user_b_id and f.following_id == user_a_id for f in follows)
     return a_follows_b and b_follows_a
+
+
+async def _analyze_and_log_message(sender_id: int, content: str, db: AsyncSession):
+    """
+    Shared DM analysis path — mirrors routers/posts.py's post-creation
+    pipeline (risk history -> analyze_text -> EmotionLog -> agent check ->
+    AgentDecision) so a DM saying something acutely concerning can trigger
+    the same intervention path a post would, not just a silently-stored
+    risk_score nobody acts on.
+
+    Scoped to the SENDER — a message reflects the sender's state, same as
+    EmotionLog(source="message") already being keyed on user_id=sender.
+
+    Returns the PipelineResult so callers can still populate the Message
+    row and websocket payload as before.
+    """
+    risk_history = await get_user_risk_history(sender_id, db)
+    pipeline = analyze_text(content, risk_history)
+
+    log = EmotionLog(
+        user_id=sender_id,
+        sentiment_score=pipeline.sentiment_score,
+        emotion=pipeline.emotion,
+        emotion_score=pipeline.emotion_score,
+        risk_score=pipeline.risk_score,
+        source="message",
+    )
+    db.add(log)
+
+    history = await get_emotion_history(sender_id, db)
+    current_snap = EmotionSnapshot(
+        sentiment_score=pipeline.sentiment_score,
+        emotion=pipeline.emotion,
+        emotion_score=pipeline.emotion_score,
+        risk_score=pipeline.risk_score,
+        source="message",
+    )
+    agent_report = run_agents(current_snap, history)
+
+    db.add(AgentDecision(
+        user_id=sender_id,
+        risk_level=agent_report.risk_level,
+        decision=agent_report.decision,
+        intervention=agent_report.intervention,
+        rag_suggestion=agent_report.rag_suggestion,
+        metadata_json=agent_report.metadata,
+    ))
+    log.agent_action = agent_report.decision
+
+    return pipeline
 
 
 # ── WebSocket Connection Manager ──────────────────────────────
@@ -114,8 +166,8 @@ async def websocket_chat(
                 })
                 continue
 
-            # Run AI pipeline silently
-            pipeline = analyze_text(content)
+            # Run AI pipeline silently (risk-history-aware, agent-checked)
+            pipeline = await _analyze_and_log_message(user_id, content, db)
 
             # Save message
             msg = Message(
@@ -128,18 +180,15 @@ async def websocket_chat(
             )
             db.add(msg)
 
-            # Log emotion
-            db.add(EmotionLog(
-                user_id=user_id,
-                sentiment_score=pipeline.sentiment_score,
-                emotion=pipeline.emotion,
-                emotion_score=pipeline.emotion_score,
-                risk_score=pipeline.risk_score,
-                source="message",
-            ))
-
             await db.commit()
             await db.refresh(msg)
+            await create_notification(
+             db=db,
+             user_id=receiver_id,
+             from_user_id=user_id,
+             notification_type="message",
+             message=f"{sender.username} sent you a message",
+            )
 
             # Build response payload
             payload = {
@@ -179,24 +228,26 @@ async def websocket_chat(
 @router.post("", response_model=MessageOut, status_code=201)
 async def send_message(
     body: MessageCreate,
-    current_user: User = Depends(get_current_user),
+    current_user: User | None = Depends(get_optional_user),
     db: AsyncSession = Depends(get_db),
 ):
     """REST fallback for sending messages."""
+    sender_id = body.sender_id
+    if current_user and current_user.id != sender_id:
+        raise HTTPException(status_code=403, detail="Sender mismatch with authenticated user")
+
+    sender = await db.get(User, sender_id)
+    if not sender:
+        raise HTTPException(status_code=404, detail="Sender not found")
+
     receiver = await db.get(User, body.receiver_id)
     if not receiver:
-        raise HTTPException(status_code=404, detail="User not found")
+        raise HTTPException(status_code=404, detail="Receiver not found")
 
-    if not await are_mutual_followers(db, current_user.id, body.receiver_id):
-        raise HTTPException(
-            status_code=403,
-            detail="You can only message users who follow you back.",
-        )
-        
-    pipeline = analyze_text(body.content)
+    pipeline = await _analyze_and_log_message(sender_id, body.content, db)
 
     msg = Message(
-        sender_id=current_user.id,
+        sender_id=sender_id,
         receiver_id=body.receiver_id,
         content=body.content,
         sentiment=pipeline.sentiment,
@@ -205,28 +256,26 @@ async def send_message(
     )
     db.add(msg)
 
-    db.add(EmotionLog(
-        user_id=current_user.id,
-        sentiment_score=pipeline.sentiment_score,
-        emotion=pipeline.emotion,
-        emotion_score=pipeline.emotion_score,
-        risk_score=pipeline.risk_score,
-        source="message",
-    ))
-
     await db.commit()
     await db.refresh(msg)
+    await create_notification(
+     db=db,
+     user_id=body.receiver_id,
+     from_user_id=sender.id,
+     notification_type="message",
+     message=f"{sender.username} sent you a message",
+    )
 
     # Notify receiver via WebSocket if online
     await manager.send_to_user(body.receiver_id, {
         "type": "new_message",
         "id": msg.id,
-        "sender_id": current_user.id,
+        "sender_id": sender.id,
         "content": body.content,
         "created_at": msg.created_at.isoformat(),
         "sender": {
-            "username": current_user.username,
-            "avatar_url": current_user.avatar_url,
+            "username": sender.username,
+            "avatar_url": sender.avatar_url,
         },
     })
 
@@ -277,25 +326,25 @@ async def get_conversations(
     return list(conversations.values())
 
 
-@router.get("/thread/{other_user_id}", response_model=list[MessageOut])
+@router.get("/thread/{user_id}/{other_user_id}", response_model=list[MessageOut])
 async def get_thread(
+    user_id: int,
     other_user_id: int,
     limit: int = 50,
-    current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Get message thread between current user and another user."""
+    """Get message thread between two users."""
     result = await db.execute(
         select(Message)
         .where(
             or_(
                 and_(
-                    Message.sender_id == current_user.id,
+                    Message.sender_id == user_id,
                     Message.receiver_id == other_user_id,
                 ),
                 and_(
                     Message.sender_id == other_user_id,
-                    Message.receiver_id == current_user.id,
+                    Message.receiver_id == user_id,
                 ),
             )
         )
@@ -304,9 +353,9 @@ async def get_thread(
     )
     messages = result.scalars().all()
 
-    # Mark as read
+    # Mark as read for the requested user
     for msg in messages:
-        if msg.receiver_id == current_user.id and not msg.is_read:
+        if msg.receiver_id == user_id and not msg.is_read:
             msg.is_read = True
     await db.commit()
 

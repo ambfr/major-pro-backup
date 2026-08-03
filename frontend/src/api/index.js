@@ -22,6 +22,8 @@ export const getUserMessages = (userId) => api.get(`/messages/${userId}`)
 export const recordInteraction = (data) => api.post('/interactions', data)
 export const addComment = (data) => api.post('/interactions/comment', data)
 export const getComments = (postId) => api.get(`/interactions/comments/${postId}`)
+export const reportPost = (data) => api.post('/interactions/report', data)
+export const recordImpression = (data) => api.post('/interactions/impression', data)
 
 // Analytics
 export const getAnalytics = (userId, limit = 50) => api.get(`/analytics/${userId}?limit=${limit}`)
