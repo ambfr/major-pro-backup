@@ -307,7 +307,6 @@ class NotInterested(Base):
     post   = relationship("Post")
     user   = relationship("User", foreign_keys=[user_id])
     author = relationship("User", foreign_keys=[author_id])
-    from sqlalchemy import Column, Integer, String
 
 
 class Reel(Base):
