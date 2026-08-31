@@ -11,6 +11,7 @@ import { useAuth } from './context/AuthContext.jsx'
 // Pages
 import AuthPage from './pages/AuthPage.jsx'
 import FeedPage from './components/Feed/FeedPage.jsx'
+import ExplorePage from './components/Feed/ExplorePage.jsx'
 import ReelsPage from './components/Reels/ReelsPage.jsx'
 import MessagesPage from './components/Messages/MessagesPage.jsx'
 import DashboardPage from './components/Dashboard/DashboardPage.jsx'
@@ -152,7 +153,7 @@ export default function App() {
             <Protected><FeedPage /></Protected>
           } />
           <Route path="/explore" element={
-            <Protected><FeedPage explore /></Protected>
+            <Protected><ExplorePage /></Protected>
           } />
           <Route path="/reels" element={
             <Protected><ReelsPage /></Protected>

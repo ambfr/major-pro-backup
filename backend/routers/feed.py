@@ -3,6 +3,13 @@ Feed Router
 GET /api/feed/         → personalized feed
 GET /api/feed/explore  → discover new content
 GET /api/feed/reels    → reels feed
+
+NOTE: Route order matters here. FastAPI/Starlette match routes in the
+order they're registered, not by specificity. All static-path routes
+(/trending, /explore, /reels, /stories) MUST be registered before the
+dynamic /{user_id} route — otherwise a request to e.g. /explore gets
+caught by /{user_id} first, Pydantic tries to coerce "explore" to an
+int, and you get a 422 instead of ever reaching the real handler.
 """
 
 from fastapi import APIRouter, Depends, Query
@@ -42,27 +49,7 @@ async def get_feed(
     return posts
 
 
-@router.get("/{user_id}", response_model=list[PostOut])
-async def get_feed_for_user(
-    user_id: int,
-    limit: int = Query(default=20, le=50),
-    offset: int = Query(default=0),
-    db: AsyncSession = Depends(get_db),
-):
-    """
-    Personalized feed for a user by id. This endpoint is used by tests and allows
-    feed retrieval without bearer authentication.
-    """
-
-    posts = await build_feed(
-        user_id=user_id,
-        db=db,
-        limit=limit,
-        offset=offset,
-    )
-    await attach_like_status(posts, user_id, db)
-    return posts
-
+# ── Static routes registered BEFORE /{user_id} ─────────────────
 
 @router.get("/trending")
 async def get_trending(
@@ -75,6 +62,7 @@ async def get_trending(
 @router.get("/explore", response_model=list[PostOut])
 async def get_explore(
     limit: int = Query(default=30, le=50),
+    offset: int = Query(default=0, ge=0),
     current_user: UserModel = Depends(get_optional_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -94,8 +82,10 @@ async def get_explore(
         )
         .order_by(
             Post.feed_score.desc(),
-            Post.likes_count.desc()
+            Post.likes_count.desc(),
+            Post.id.desc()  # tiebreaker so pagination is stable when scores/likes tie
         )
+        .offset(offset)
         .limit(limit)
     )
 
@@ -206,3 +196,27 @@ async def get_stories(
         })
 
     return list(stories_by_user.values())
+
+
+# ── Dynamic route registered LAST ──────────────────────────────
+
+@router.get("/{user_id}", response_model=list[PostOut])
+async def get_feed_for_user(
+    user_id: int,
+    limit: int = Query(default=20, le=50),
+    offset: int = Query(default=0),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Personalized feed for a user by id. This endpoint is used by tests and allows
+    feed retrieval without bearer authentication.
+    """
+
+    posts = await build_feed(
+        user_id=user_id,
+        db=db,
+        limit=limit,
+        offset=offset,
+    )
+    await attach_like_status(posts, user_id, db)
+    return posts

@@ -15,7 +15,7 @@ import logging
 from config import settings
 from models.database import create_tables
 from services.cloudinary_service import UPLOAD_ROOT
-from routers import auth, users, posts, feed, messages, notifications, analytics, interactions, agents
+from routers import auth, users, posts, feed, messages, notifications, analytics, interactions, agents, stories
 
 from ai.pipeline.loader import preload_models
 from ai.rag.index import build_rag_index
@@ -82,6 +82,7 @@ app.include_router(notifications.router,    prefix="/api/notifications", tags=["
 app.include_router(analytics.router,        prefix="/api/analytics",    tags=["Analytics"])
 app.include_router(interactions.router,     prefix="/api/interactions",  tags=["Interactions"])
 app.include_router(agents.router,           prefix="/api/agents",       tags=["Agents"])
+app.include_router(stories.router,          prefix="/api/stories",      tags=["Stories"])
 
 # Serve locally uploaded media (used when Cloudinary is not configured)
 UPLOAD_ROOT.mkdir(parents=True, exist_ok=True)

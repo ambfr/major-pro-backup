@@ -90,32 +90,25 @@ async def get_emotion_history(
 @router.post("", response_model=PostOut, status_code=201)
 async def create_post(
     request: Request,
-    user_id: Optional[int] = Form(default=None),
     content: str = Form(default=""),
     location: str = Form(default=""),
     is_reel: bool = Form(default=False),
     images: Optional[list[UploadFile]] = File(default=None),
     image: Optional[UploadFile] = File(default=None),
     video: Optional[UploadFile] = File(default=None),
-    current_user: Optional[User] = Depends(get_optional_user),
+    current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
     content_type = request.headers.get("content-type", "").lower()
     if "application/json" in content_type:
         body = await request.json()
-        user_id = body.get("user_id", user_id)
         content = body.get("content", content or "")
         location = body.get("location", location or "")
         is_reel = body.get("is_reel", is_reel)
 
-    if user_id is None:
-        raise HTTPException(status_code=400, detail="user_id is required")
-
-    user = await db.get(User, user_id)
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
-    if current_user and current_user.id != user_id:
-        raise HTTPException(status_code=403, detail="Cannot create a post for another user")
+    # Author is always the authenticated user — never trust a client-supplied
+    # user_id, or anyone could post as anyone else just by changing that field.
+    user = current_user
 
     image_files = [file for file in (images or []) if file and file.filename]
     if image and image.filename:
@@ -174,19 +167,6 @@ async def create_post(
         else "photo post"
     )
 
-    # NOTE: text_to_analyze is a placeholder ("shared a photo") when there's
-    # no real caption -- it exists only so the sentiment/emotion classifiers
-    # have *something* to run on. It must NOT be used to decide whether the
-    # caption is "empty" (that placeholder has plenty of characters), and it
-    # was previously the only text passed to analyze_text, meaning:
-    #   1. media_source was never passed in at all, so blend_media_signal
-    #      always took its "no media" early-return branch -- image/video
-    #      analysis never influenced sentiment/risk/emotion.
-    #   2. even once media_source is wired in, the empty-caption bypass
-    #      inside the pipeline needs to see the REAL caption (`content`),
-    #      not the placeholder, or a captionless photo post would let the
-    #      placeholder's classifier output vote against the image's actual
-    #      emotion read.
     media_url_for_analysis = (
         first_image["url"] if first_image
         else first_video["url"] if first_video
@@ -225,12 +205,6 @@ async def create_post(
     db.add(post)
     await db.flush()  # assigns post.id, needed before creating PostMedia rows below
 
-    # IMPORTANT: don't do `post.media = [...]` here.
-    # Assigning a list to an async relationship forces SQLAlchemy to lazy-load
-    # the existing collection first to diff against it, which fires a sync-style
-    # query the async session can't service inline -> MissingGreenlet.
-    # Setting post_id explicitly and adding each row individually sidesteps
-    # the relationship's collection-loading logic entirely.
     for item in uploaded_media:
         db.add(PostMedia(
             post_id=post.id,
@@ -288,10 +262,6 @@ async def create_post(
 
     await db.commit()
 
-    # Explicitly (re)load the media relationship via an awaited query instead
-    # of a plain db.refresh(post), which would NOT reload `media` and could
-    # trigger the same MissingGreenlet error later when PostOut serializes
-    # post.media (an implicit lazy-load on the way out).
     await db.refresh(post, attribute_names=["media"])
 
     post.author = user
@@ -306,12 +276,9 @@ async def get_user_posts(
     user_id: int,
     limit: int = 20,
     offset: int = 0,
+    current_user: Optional[User] = Depends(get_optional_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """
-    Get all posts of a user.
-    """
-
     result = await db.execute(
         select(Post)
         .options(selectinload(Post.media))
@@ -320,14 +287,12 @@ async def get_user_posts(
         .limit(limit)
         .offset(offset)
     )
-
     posts = result.scalars().all()
-
     user = await db.get(User, user_id)
-
-    for post in posts:
-        post.author = user
-
+    for p in posts:
+        p.author = user
+    if current_user:
+        await attach_like_status(posts, current_user.id, db)
     return posts
 # --------------------------------------------------
 # Get Single Post
@@ -358,7 +323,6 @@ async def get_post(
         await attach_like_status([post], current_user.id, db)
 
     return post
-    
 
 
 # --------------------------------------------------
@@ -391,9 +355,6 @@ async def delete_post(
             detail="Not your post",
         )
 
-    # Clean up Cloudinary storage before deleting the DB row.
-    # Best-effort: delete_asset() already swallows its own errors,
-    # so a Cloudinary hiccup never blocks the actual post deletion.
     for media in post.media:
         delete_asset(media.public_id, resource_type=media.media_type)
 
@@ -446,7 +407,6 @@ async def toggle_like(
 
     if existing:
 
-        # Unlike
         await db.delete(existing)
 
         post.likes_count = max(
@@ -458,7 +418,6 @@ async def toggle_like(
 
     else:
 
-        # Like
         like = Like(
             post_id=post_id,
             user_id=current_user.id,
@@ -470,14 +429,12 @@ async def toggle_like(
 
         action = "liked"
 
-        # Update recommendation algorithm
         await update_user_interests(
             current_user.id,
             post.emotion,
             db,
         )
 
-        # Create notification
         if post.user_id != current_user.id:
 
             await create_notification(
@@ -492,11 +449,6 @@ async def toggle_like(
     await db.commit()
 
     if action == "liked":
-        # Behavioral signal: liking is content-less, so this logs the
-        # LIKED POST's existing emotion/risk into the LIKER's own risk
-        # trajectory rather than re-running analyze_text (nothing to
-        # analyze). Runs after the like is committed so it never blocks
-        # the like itself. See services/algorithm.py for details.
         await log_like_behavioral_signal(current_user.id, post, db)
 
 
@@ -528,27 +480,3 @@ async def get_post_likers(
         .offset(offset)
     )
     return result.scalars().all()
-
-@router.get("/user/{user_id}", response_model=list[PostOut])
-async def get_user_posts(
-    user_id: int,
-    limit: int = 20,
-    offset: int = 0,
-    current_user: Optional[User] = Depends(get_optional_user),
-    db: AsyncSession = Depends(get_db),
-):
-    result = await db.execute(
-        select(Post)
-        .options(selectinload(Post.media))
-        .where(Post.user_id == user_id)
-        .order_by(Post.created_at.desc())
-        .limit(limit)
-        .offset(offset)
-    )
-    posts = result.scalars().all()
-    user = await db.get(User, user_id)
-    for p in posts:
-        p.author = user
-    if current_user:
-        await attach_like_status(posts, current_user.id, db)
-    return posts
