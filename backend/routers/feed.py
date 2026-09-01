@@ -67,18 +67,23 @@ async def get_explore(
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Explore page — only normal posts.
-    Reels are excluded.
+    Explore page — posts AND reels from public accounts,
+    regardless of whether the current user follows them.
+
+    (Previously this excluded reels via is_reel == False and had no
+    privacy filter at all, which let private accounts' posts leak in.
+    Fixed: reels included, private accounts excluded.)
     """
 
     cutoff = datetime.utcnow() - timedelta(days=14)
 
     result = await db.execute(
         select(Post)
+        .join(User, User.id == Post.user_id)
         .options(selectinload(Post.media))
         .where(
             Post.created_at >= cutoff,
-            Post.is_reel == False
+            User.is_private == False,
         )
         .order_by(
             Post.feed_score.desc(),
