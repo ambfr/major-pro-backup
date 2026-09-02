@@ -5,13 +5,15 @@ FastAPI Backend Entry Point
 
 from dotenv import load_dotenv
 load_dotenv()
-
+from routers import reels
+app.include_router(reels.router)
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from contextlib import asynccontextmanager
 import logging
-
+from routers import chat
+app.include_router(chat.router, prefix="/api/chat", tags=["chat"])
 from config import settings
 from models.database import create_tables
 from services.cloudinary_service import UPLOAD_ROOT
