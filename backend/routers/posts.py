@@ -183,7 +183,7 @@ async def create_post(
     pipeline = analyze_text(
         text_to_analyze,
         risk_history,
-        media_source=None,   # ← text-only analysis, media analysis disabled
+        media_source=media_source_for_analysis,   # ← text-only analysis, media analysis disabled
         original_content=content,
     )
 

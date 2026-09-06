@@ -10,6 +10,7 @@ Everything lives in this one file:
 """
 
 import os
+import re
 import logging
 import tempfile
 from dataclasses import dataclass, field
@@ -138,6 +139,7 @@ def _clip_emotion(image: Image.Image) -> tuple[str, float]:
 
     top_label = max(best_per_label, key=best_per_label.get)
     top_score = round(best_per_label[top_label], 4)
+    logger.info(f"CLIP emotion scores (all labels): {best_per_label} -> winner={top_label}({top_score})")
     return top_label, top_score
 
 
@@ -185,11 +187,47 @@ def _clip_similarities(image: Image.Image, prompts: list[str]) -> list[float]:
     return probs.tolist()
 
 
+def extract_text_from_image(image: Image.Image) -> str:
+    """
+    OCR extraction for text rendered INTO an image -- quote cards, memes,
+    screenshots of a message. CLIP's prompts describe faces/scenes; they
+    can't read words. This is a separate, literal signal: if there's real
+    text in the image, what it SAYS matters more than what the image
+    visually "feels like" to CLIP.
+
+    Requires pytesseract (pip install pytesseract) AND the Tesseract-OCR
+    engine itself installed separately -- pytesseract is just a Python
+    wrapper around that binary, it does not bundle it.
+    Windows installer: https://github.com/UB-Mannheim/tesseract/wiki
+    After installing, you may need to point pytesseract at it explicitly,
+    e.g. pytesseract.pytesseract.tesseract_cmd set to the full path of
+    tesseract.exe under your Tesseract-OCR install folder.
+    """
+    try:
+        import pytesseract
+    except ImportError as exc:
+        raise ImportError(
+            "pytesseract is required for image text extraction. "
+            "Install it with: pip install pytesseract "
+            "(and the Tesseract-OCR engine itself -- see function docstring)."
+        ) from exc
+
+    raw = pytesseract.image_to_string(image)
+    return re.sub(r"\s+", " ", raw).strip()
+
+
 def analyze_image(image_source: str) -> dict:
     """
     Returns {"sentiment_score": float in [-1, 1], "risk_score": float in [0, 1]}
     for a single image, using CLIP zero-shot similarity against the prompt
-    sets above.
+    sets above -- PLUS an OCR pass for any text rendered into the image
+    (quote cards, memes, screenshotted text). When substantial text is
+    found, it's treated as more authoritative than CLIP's visual read for
+    sentiment/emotion (real words beat a guess from colors/shapes), and
+    it's also run through the same crisis-phrase hard-floor check your
+    captions already get -- a self-harm-related quote posted as an image
+    with no caption should not silently bypass that safety check just
+    because it arrived as pixels instead of typed text.
     """
     image = _load_image(image_source)
 
@@ -205,9 +243,46 @@ def analyze_image(image_source: str) -> dict:
 
     emotion, emotion_score = _clip_emotion(image)
 
+    ocr_text = ""
+    try:
+        ocr_text = extract_text_from_image(image)
+    except ImportError as exc:
+        # pytesseract itself isn't installed (pip install pytesseract).
+        logger.warning(f"OCR unavailable, skipping text-in-image check: {exc}")
+    except Exception as exc:
+        # Covers pytesseract.TesseractNotFoundError and anything else that
+        # can go wrong at OCR time (corrupt image, engine crash, etc).
+        # This must never take down the whole post-creation request --
+        # OCR is a bonus signal, not a required one. Falling back to
+        # CLIP-only results here, same as if OCR simply found no text.
+        logger.warning(f"OCR failed, continuing without it: {exc}")
+
+    OCR_MIN_LENGTH = 8  # below this, it's noise/garbage OCR, not real text
+    if len(ocr_text) >= OCR_MIN_LENGTH:
+        ocr_sentiment, ocr_sentiment_score = run_sentiment(ocr_text)
+        ocr_emotion, ocr_emotion_score = run_emotion(ocr_text)
+        ocr_risk_detail = detect_depression_suicide_risk(ocr_text)
+
+        logger.info(
+            f"OCR text found in image -- \"{ocr_text[:80]}\" -> "
+            f"sentiment={ocr_sentiment}({ocr_sentiment_score}), "
+            f"emotion={ocr_emotion}({ocr_emotion_score}), "
+            f"risk_detail.score={ocr_risk_detail.score}, "
+            f"hard_floor={ocr_risk_detail.hard_floor_triggered}"
+        )
+
+        # Real words win over a visual guess -- literal text is a stronger
+        # signal than CLIP's zero-shot read of a static image.
+        sentiment_score = ocr_sentiment_score
+        emotion, emotion_score = ocr_emotion, ocr_emotion_score
+
+        ocr_risk = 1.0 if ocr_risk_detail.hard_floor_triggered else ocr_risk_detail.score
+        risk_score = round(max(risk_score, ocr_risk), 4)
+
     logger.debug(
         f"Image analysis -> source={image_source}, sentiment_score={sentiment_score}, "
-        f"risk_score={risk_score}, emotion={emotion}({emotion_score})"
+        f"risk_score={risk_score}, emotion={emotion}({emotion_score}), "
+        f"ocr_text_found={bool(ocr_text)}"
     )
 
     return {
@@ -562,6 +637,19 @@ def resolve_effective_emotion(
     automated visual read); higher weighted confidence wins.
     """
     if text_is_empty:
+        return media_emotion, media_emotion_score
+
+    # Safety override: a distressing image shouldn't be masked by an
+    # upbeat caption. If the media read is sadness/fear at a reasonably
+    # confident level, it wins outright -- doesn't need to out-vote text,
+    # just needs to be a real signal, not a coin-flip guess. Asymmetric
+    # on purpose: a happy image doesn't override a sad caption the same
+    # way, since under-reacting to real distress is the failure mode
+    # that matters here, not over-reacting to a sad image paired with an
+    # unrelated happy caption.
+    SAFETY_OVERRIDE_EMOTIONS = {"sadness", "fear"}
+    SAFETY_OVERRIDE_THRESHOLD = 0.55
+    if media_emotion in SAFETY_OVERRIDE_EMOTIONS and media_emotion_score >= SAFETY_OVERRIDE_THRESHOLD:
         return media_emotion, media_emotion_score
 
     if text_emotion == media_emotion:
