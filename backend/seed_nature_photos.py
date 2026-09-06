@@ -16,6 +16,8 @@ seed_from_pexels.py):
     python seed_nature_photos.py
     python seed_nature_photos.py --count 150
 """
+import logging
+logging.basicConfig(level=logging.INFO, format="%(message)s")
 
 import argparse
 import asyncio

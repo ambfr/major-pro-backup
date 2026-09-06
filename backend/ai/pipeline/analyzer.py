@@ -38,7 +38,7 @@ from schemas.schemas import PipelineResult
 from ai.pipeline.loader import get_model
 from ai.pipeline.numbness_detector import detect_numbness_signal
 from ai.pipeline.risk_detector import detect_depression_suicide_risk, RiskTier
-
+from ai.pipeline.emotion_arbiter import arbitrate_emotion, should_arbitrate
 logger = logging.getLogger("mindgram.pipeline")
 
 
@@ -572,18 +572,44 @@ def run_sentiment(text: str) -> tuple[str, float]:
 # Falling back to neutral here is honest about that uncertainty instead
 # of quietly presenting a coin-flip guess as a confident classification.
 EMOTION_CONFIDENCE_FLOOR = 0.5
-
+# Above the neutral floor but below this, the local classifier's top-1 pick
+# is exactly the band where it tends to anchor on a single emotion-loaded
+# word rather than the sentence's real meaning (see emotion_arbiter.py's
+# docstring). Genuinely confident calls above this ceiling are trusted as-is.
+EMOTION_BORDERLINE_CEILING = 0.65
 
 def run_emotion(text: str) -> tuple[str, float]:
     model = get_model("emotion")
     result = _top_result(model(text))
-    label = result["label"].lower()
-    label = EMOTION_LABELS.get(label, "neutral")
-    score = round(result["score"], 4)
-    if score < EMOTION_CONFIDENCE_FLOOR:
-        return "neutral", score
-    return label, score
+    local_label = result["label"].lower()
+    local_label = EMOTION_LABELS.get(local_label, "neutral")
+    local_score = round(result["score"], 4)
 
+    if local_score < EMOTION_CONFIDENCE_FLOOR:
+        local_label, local_score = "neutral", local_score
+
+    arbitrated = arbitrate_emotion(text, local_label, local_score)
+    if arbitrated is None:
+        # Groq unavailable/failed -- fall back to the local result entirely.
+        return local_label, local_score
+
+    groq_label, groq_score = arbitrated
+    agree = groq_label == local_label
+
+    logger.info(
+        f"Emotion check -- text={text[:80]!r}, "
+        f"local={local_label}({local_score}), groq={groq_label}({groq_score}), "
+        f"agree={agree}"
+    )
+
+    if agree:
+        # Both models agree -- keep the local model's own confidence, since
+        # agreement itself is the signal, not Groq's self-reported number.
+        return local_label, local_score
+
+    # Disagreement -- trust Groq's read, since it reasons over the full
+    # sentence rather than anchoring on a single emotion-loaded word.
+    return groq_label, groq_score
 
 def run_sarcasm(text: str) -> tuple[bool, float]:
     model = get_model("sarcasm")

@@ -5,7 +5,7 @@ GET  /api/posts/{id}     → get post
 DELETE /api/posts/{id}   → delete post
 POST /api/posts/{id}/like → like/unlike post
 """
-from services.cloudinary_service import UPLOAD_ROOT
+from services.cloudinary_service import UPLOAD_ROOT, delete_asset
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
